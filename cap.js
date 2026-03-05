@@ -4,9 +4,10 @@
  * FriendlyCaptcha Puzzle Solver — Node.js implementation
  *
  * Solves FriendlyCaptcha proof-of-work puzzles using Blake2b-256.
- * Uses the native JavaScript solver (no WebAssembly).
- * The heavy computation runs in a Node.js Worker Thread so the main
- * thread stays non-blocking.
+ * Uses the bundled WebAssembly solver (wasm/solver.wasm) for maximum speed,
+ * falling back automatically to the pure-JavaScript implementation if WASM is
+ * unavailable.  The heavy computation runs in a Node.js Worker Thread so the
+ * main thread stays non-blocking.
  *
  * Token format (compatible with friendly-challenge v0.9.12 widget):
  *   frc-captcha-solution = "<signature>.<puzzleBase64>.<solutionBase64>.<diagnosticsBase64>"
@@ -19,6 +20,8 @@
  */
 
 const { Worker, isMainThread, parentPort } = require('worker_threads');
+const fs    = require('fs');
+const path  = require('path');
 const https = require('https');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -515,80 +518,96 @@ function buildSolutionToken(signature, puzzleBase64, solutionBuffer, diagnostics
 
 if (!isMainThread) {
   /**
-   * Initialises the native JS solver and posts a 'ready' message to the parent thread.
-   * @returns {{ solver: Function, solverID: number }}
+   * Initialises the solver: tries the bundled WASM binary first (fast path),
+   * falls back to the pure-JS implementation if WASM is unavailable.
+   *
+   * @returns {Promise<{ solver: Function, solverID: number }>}
    */
-  function initSolver() {
-    const solver = createJsSolver();
-    parentPort.postMessage({ type: 'ready', solverEngine: 'js' });
-    return { solver, solverID: SOLVER_ID_JS };
+  async function initSolver() {
+    try {
+      // __dirname is valid here: workers are spawned with new Worker(__filename),
+      // so __dirname always points to the same directory as the main script.
+      const wasmPath  = path.join(__dirname, 'wasm', 'solver.wasm');
+      const wasmBytes = fs.readFileSync(wasmPath);
+      const solver    = await createWasmSolver(wasmBytes);
+      parentPort.postMessage({ type: 'ready', solverEngine: 'wasm' });
+      return { solver, solverID: SOLVER_ID_WASM };
+    } catch (wasmErr) {
+      // WASM unavailable (missing file, unsupported runtime, etc.) — use pure JS.
+      process.stderr.write(`[cap] WASM solver unavailable (${wasmErr.message}), using JS fallback\n`);
+      const solver = createJsSolver();
+      parentPort.postMessage({ type: 'ready', solverEngine: 'js' });
+      return { solver, solverID: SOLVER_ID_JS };
+    }
   }
 
-  const solverInitResult = initSolver();
+  initSolver().then(({ solver, solverID }) => {
+    parentPort.on('message', async (msg) => {
+      if (msg.type !== 'solve') return;
 
-  parentPort.on('message', async (msg) => {
-    if (msg.type !== 'solve') return;
+      try {
+        const { solverInput, threshold, puzzleIndex, numPuzzles } = msg;
 
-    try {
-      const { solver, solverID } = solverInitResult;
-      const { solverInput, threshold, puzzleIndex, numPuzzles } = msg;
+        let solvedInput    = null;
+        let totalHashCount = 0;
 
-      let solvedInput    = null;
-      let totalHashCount = 0;
+        // Outer loop: iterate byte 123 (0–255) as an additional nonce dimension.
+        // Matches the outer loop in the original WebWorker cap.js.
+        for (let outerNonce = 0; outerNonce < 256; outerNonce++) {
+          solverInput[OUTER_NONCE_BYTE] = outerNonce;
+          const [updatedInput, hashBytes] = solver(solverInput, threshold);
 
-      // Outer loop: iterate byte 123 (0–255) as an additional nonce dimension.
-      // Matches the outer loop in the original WebWorker cap.js.
-      for (let outerNonce = 0; outerNonce < 256; outerNonce++) {
-        solverInput[OUTER_NONCE_BYTE] = outerNonce;
-        const [updatedInput, hashBytes] = solver(solverInput, threshold);
+          if (hashBytes.length > 0) {
+            solvedInput = updatedInput;
+            break;
+          }
 
-        if (hashBytes.length > 0) {
-          solvedInput = updatedInput;
-          break;
+          // Accumulate work: this pass exhausted ~2^32 counter values (0xFFFFFFFF = 2^32 - 1)
+          totalHashCount += 0xFFFFFFFF;
         }
 
-        // Accumulate work: this pass exhausted ~2^32 counter values (0xFFFFFFFF = 2^32 - 1)
-        totalHashCount += 0xFFFFFFFF;
-      }
+        if (solvedInput === null) {
+          parentPort.postMessage({
+            type: 'error',
+            message: `No solution found after 256 × 2^32 iterations (puzzle ${puzzleIndex})`
+          });
+          return;
+        }
 
-      if (solvedInput === null) {
+        // Add the final inner-counter value to get total hashes computed.
+        // Matches: g += new DataView(I.slice(-4).buffer).getUint32(0, true)
+        const finalCounterView = new DataView(
+          solvedInput.buffer, solvedInput.byteOffset + INNER_NONCE_OFFSET, 4
+        );
+        totalHashCount += finalCounterView.getUint32(0, /*littleEndian=*/true);
+
+        // The solution nonce is bytes 120–127 of the solved input:
+        //   byte 120: puzzle index
+        //   bytes 121–122: zeros
+        //   byte 123: outer nonce that succeeded
+        //   bytes 124–127: inner counter value that produced hash < threshold
+        // This matches `solution: I.slice(-8)` in the original WebWorker.
+        const solutionSegment = Buffer.from(solvedInput.slice(PUZZLE_INDEX_BYTE, SOLVER_INPUT_SIZE));
+
         parentPort.postMessage({
-          type: 'error',
-          message: `No solution found after 256 × 2^32 iterations (puzzle ${puzzleIndex})`
+          type: 'done',
+          solutionSegment,      // 8-byte Buffer (bytes 120–127 of the solved input)
+          solverID,             // SOLVER_ID_JS or SOLVER_ID_WASM
+          totalHashCount,       // total Blake2b hashes computed
+          puzzleIndex,          // which sub-puzzle this solves (0-based)
+          numPuzzles            // total number of sub-puzzles in this challenge
         });
-        return;
+      } catch (err) {
+        parentPort.postMessage({ type: 'error', message: err.message });
       }
+    });
 
-      // Add the final inner-counter value to get total hashes computed.
-      // Matches: g += new DataView(I.slice(-4).buffer).getUint32(0, true)
-      const finalCounterView = new DataView(
-        solvedInput.buffer, solvedInput.byteOffset + INNER_NONCE_OFFSET, 4
-      );
-      totalHashCount += finalCounterView.getUint32(0, /*littleEndian=*/true);
-
-      // The solution nonce is bytes 120–127 of the solved input:
-      //   byte 120: puzzle index
-      //   bytes 121–122: zeros
-      //   byte 123: outer nonce that succeeded
-      //   bytes 124–127: inner counter value that produced hash < threshold
-      // This matches `solution: I.slice(-8)` in the original WebWorker.
-      const solutionSegment = Buffer.from(solvedInput.slice(PUZZLE_INDEX_BYTE, SOLVER_INPUT_SIZE));
-
-      parentPort.postMessage({
-        type: 'done',
-        solutionSegment,      // 8-byte Buffer (bytes 120–127 of the solved input)
-        solverID,             // SOLVER_ID_JS or SOLVER_ID_WASM
-        totalHashCount,       // total Blake2b hashes computed
-        puzzleIndex,          // which sub-puzzle this solves (0-based)
-        numPuzzles            // total number of sub-puzzles in this challenge
-      });
-    } catch (err) {
-      parentPort.postMessage({ type: 'error', message: err.message });
-    }
-  });
-
-  parentPort.on('error', (err) => {
-    process.stderr.write(`[cap] Worker port error: ${err.message}\n`);
+    parentPort.on('error', (err) => {
+      process.stderr.write(`[cap] Worker port error: ${err.message}\n`);
+    });
+  }).catch((err) => {
+    process.stderr.write(`[cap] Worker init error: ${err.stack || err.message}\n`);
+    process.exit(1);
   });
 }
 
@@ -694,7 +713,7 @@ if (isMainThread) {
     // Assemble the solution buffer: 8 bytes per sub-puzzle in index order
     const solutionBuffer = new Uint8Array(numPuzzles * 8);
     let   totalHashCount = 0;
-    let   solverID       = SOLVER_ID_JS;
+    let   solverID       = SOLVER_ID_WASM; // downgrade to JS if any worker used JS fallback
 
     for (const result of workerResults) {
       solutionBuffer.set(result.solutionSegment, result.puzzleIndex * 8);

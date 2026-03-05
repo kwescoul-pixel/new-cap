@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FriendlyCaptcha — frc-captcha-solution</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; }
+    #status { margin-top: 8px; font-size: 13px; color: #555; }
+    #token-display {
+      margin-top: 24px; padding: 12px; background: #f4f4f4;
+      border: 1px solid #ddd; border-radius: 4px; word-break: break-all;
+      font-family: monospace; font-size: 12px; display: none;
+    }
+    #token-display strong { display: block; margin-bottom: 4px; }
+  </style>
+
+  <!-- FriendlyCaptcha widget (v0.9.12) -->
+  <script type="module"
+    src="https://cdn.jsdelivr.net/npm/friendly-challenge@0.9.12/widget.module.min.js"
+    async defer></script>
+  <script nomodule
+    src="https://cdn.jsdelivr.net/npm/friendly-challenge@0.9.12/widget.min.js"
+    async defer></script>
+</head>
+<body>
+  <h2>frc-captcha-solution</h2>
+
+  <!--
+    FriendlyCaptcha widget
+      data-sitekey  — your FriendlyCaptcha site key
+      data-callback — JS function called once the puzzle is solved
+  -->
+  <div class="frc-captcha"
+       data-sitekey="FCMSPLFFSPQ6TH80"
+       data-callback="onCaptchaSolved">
+  </div>
+
+  <p id="status">⏳ Solving…</p>
+
+  <!-- The solved token is shown here once the widget finishes -->
+  <div id="token-display">
+    <strong>frc-captcha-solution:</strong>
+    <span id="token-value"></span>
+  </div>
+
+  <script>
+    function onCaptchaSolved() {
+      var hiddenInput = document.querySelector('[name="frc-captcha-solution"]');
+      var token = hiddenInput ? hiddenInput.value : '(not found)';
+
+      document.getElementById('status').textContent = '✅ Done';
+      document.getElementById('token-value').textContent = token;
+      document.getElementById('token-display').style.display = 'block';
+
+      console.log('frc-captcha-solution:', token);
+    }
+  </script>
+</body>
+</html>

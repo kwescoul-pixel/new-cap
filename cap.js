@@ -8,6 +8,9 @@
  * The heavy computation runs in a Node.js Worker Thread so the main
  * thread stays non-blocking.
  *
+ * Token format (compatible with friendly-challenge v0.9.12 widget):
+ *   frc-captcha-solution = "<signature>.<puzzleBase64>.<solutionBase64>.<diagnosticsBase64>"
+ *
  * Usage (script):
  *   node cap.js [sitekey]
  *
@@ -235,6 +238,7 @@ function wrapAssemblyScriptExports(wasmExports) {
   const memory  = wasmExports.memory;
   const alloc   = wasmExports.__alloc;
   const retain  = wasmExports.__retain;
+
   // Runtime type information base pointer (for array element size lookups).
   // __rtti_base is always present in AssemblyScript builds; if somehow missing,
   // we throw rather than silently using an invalid memory address.
@@ -378,50 +382,133 @@ async function createWasmSolver(wasmBytes) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Puzzle Parsing
+// Puzzle Parsing  (compatible with friendly-challenge v0.9.12)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Byte offsets within the 32-byte decoded puzzle buffer.
+ * Matches the constants in the friendly-challenge v0.9.12 widget source.
+ */
+const PUZZLE_EXPIRY_OFFSET     = 13;
+const PUZZLE_NUM_PUZZLES_OFFSET = 14;
+const PUZZLE_DIFFICULTY_OFFSET  = 15;
+
+/** Size of the 128-byte solver input block. */
+const SOLVER_INPUT_SIZE = 128;
+
+/** Byte index within solverInput where the puzzle index lives. */
+const PUZZLE_INDEX_BYTE = 120;
+
+/** Byte index within solverInput for the outer nonce counter (0–255). */
+const OUTER_NONCE_BYTE = 123;
+
+/** Byte offset within solverInput for the inner uint32 counter (LE). */
+const INNER_NONCE_OFFSET = 124;
+
+/**
+ * Converts a FriendlyCaptcha difficulty byte (0–255) to a uint32 threshold.
+ * Matches `difficultyToThreshold()` in friendly-challenge v0.9.12 exactly:
+ *   difficulty 0   → ~99.99% solved on first attempt (very easy)
+ *   difficulty 150 → ~4096 hashes on average
+ *   difficulty 250+ → ~2^32 hashes on average (very hard)
+ *
+ * @param {number} difficultyByte - value 0–255 from puzzle buffer[15]
+ * @returns {number} uint32 threshold — a hash is a solution when hash[0:4] < threshold
+ */
+function difficultyToThreshold(difficultyByte) {
+  const clamped = Math.max(0, Math.min(255, difficultyByte));
+  return Math.pow(2, (255.999 - clamped) / 8.0) >>> 0;
+}
 
 /**
  * Parses a FriendlyCaptcha puzzle string into the parameters needed by the solver.
  *
- * Puzzle string format: "<accountKeyHex>.<puzzleDataBase64>"
- *   accountKeyHex    — 32 hex chars (16 bytes) — sitekey-derived identifier
- *   puzzleDataBase64 — 44 base64 chars (32 bytes) — puzzle-specific data
+ * Puzzle string format: "<signature>.<puzzleBase64>"
+ *   signature     — hex string (e.g. 32 hex chars = 16 bytes); identifies the account key
+ *   puzzleBase64  — base64-encoded 32-byte puzzle data
  *
- * Solver input layout (128 bytes total):
- *   bytes   0–15  : accountKey (decoded from hex part)
- *   bytes  16–47  : puzzleData (decoded from base64 part)
- *   bytes  48–127 : zero-padded nonce space
- *     byte  123   : outer nonce counter (iterated 0–255 by the solve loop)
- *     bytes 124–127: inner nonce counter (uint32 LE, iterated by the solver function)
+ * Solver input layout (128 bytes total, per puzzle index):
+ *   bytes   0–31  : puzzle data (decoded from base64 part)
+ *   bytes  32–119 : zero-padded nonce space
+ *   byte   120    : puzzle index (0-based, one per sub-puzzle)
+ *   bytes 121–122 : zeros
+ *   byte   123    : outer nonce counter (0–255, iterated in the outer solve loop)
+ *   bytes 124–127 : inner nonce counter (uint32 LE, iterated inside the hash loop)
  *
- * Puzzle header fields within puzzleData (relative offsets in solverInput):
- *   solverInput[28] = puzzleData[12] → number of puzzles to solve (usually 1)
- *   solverInput[29] = puzzleData[13] → difficulty bits  (threshold = 0xFFFFFFFF >>> bits)
+ * Puzzle header fields (offsets into the 32-byte puzzle buffer):
+ *   puzzleBuffer[13] → expiry coefficient (expiry = value × 300 seconds)
+ *   puzzleBuffer[14] → number of sub-puzzles to solve
+ *   puzzleBuffer[15] → difficulty byte (used to compute the hash threshold)
  *
  * @param {string} puzzleString
- * @returns {{ solverInput: Uint8Array, threshold: number, numPuzzles: number }}
+ * @returns {{ signature: string, puzzleBase64: string, baseSolverInput: Uint8Array,
+ *             threshold: number, numPuzzles: number, expiryMs: number }}
  */
 function parsePuzzle(puzzleString) {
   const dotIndex = puzzleString.indexOf('.');
   if (dotIndex === -1) throw new Error('Invalid puzzle string: missing "." separator');
 
-  const accountKeyHex    = puzzleString.slice(0, dotIndex);
-  const puzzleDataBase64 = puzzleString.slice(dotIndex + 1);
+  const signature    = puzzleString.slice(0, dotIndex);
+  const puzzleBase64 = puzzleString.slice(dotIndex + 1);
 
-  const accountKeyBytes = Buffer.from(accountKeyHex,    'hex');
-  const puzzleDataBytes = Buffer.from(puzzleDataBase64, 'base64');
+  const puzzleBuffer = Buffer.from(puzzleBase64, 'base64');
 
-  // Build the 128-byte solver input (zero-initialised, so nonce space starts at 0)
-  const solverInput = new Uint8Array(128);
-  solverInput.set(accountKeyBytes, 0);
-  solverInput.set(puzzleDataBytes, accountKeyBytes.length);
+  const numPuzzles    = puzzleBuffer[PUZZLE_NUM_PUZZLES_OFFSET];
+  const difficultyByte = puzzleBuffer[PUZZLE_DIFFICULTY_OFFSET];
+  const expiryMs      = puzzleBuffer[PUZZLE_EXPIRY_OFFSET] * 300_000;
+  const threshold     = difficultyToThreshold(difficultyByte);
 
-  const numPuzzles     = solverInput[28]; // puzzleData[12]
-  const difficultyBits = solverInput[29]; // puzzleData[13]
-  const threshold      = 0xFFFFFFFF >>> difficultyBits;
+  // Build the base 128-byte solver input: puzzle buffer at bytes 0–31, rest zeros.
+  // Each sub-puzzle gets its own copy with byte 120 set to the puzzle index.
+  const baseSolverInput = new Uint8Array(SOLVER_INPUT_SIZE);
+  baseSolverInput.set(puzzleBuffer, 0);
 
-  return { solverInput, threshold, numPuzzles };
+  return { signature, puzzleBase64, baseSolverInput, threshold, numPuzzles, expiryMs };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Solution Token Builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Solver type IDs used in the diagnostics buffer.
+ * Matches the `solverType` values in friendly-challenge v0.9.12.
+ */
+const SOLVER_ID_JS   = 1;
+const SOLVER_ID_WASM = 2;
+
+/**
+ * Builds the 3-byte diagnostics buffer included in the solution token.
+ * Matches `createDiagnosticsBuffer(solverID, timeToSolved)` in the widget.
+ *
+ * @param {number} solverID     - SOLVER_ID_JS or SOLVER_ID_WASM
+ * @param {number} totalSeconds - time taken to solve all puzzles (seconds, rounded to uint16)
+ * @returns {Uint8Array} 3-byte diagnostics buffer
+ */
+function buildDiagnosticsBuffer(solverID, totalSeconds) {
+  const buf  = new Uint8Array(3);
+  const view = new DataView(buf.buffer);
+  view.setUint8(0, solverID);
+  view.setUint16(1, Math.min(Math.round(totalSeconds), 0xFFFF)); // clamped to uint16 range
+  return buf;
+}
+
+/**
+ * Assembles the final `frc-captcha-solution` token string.
+ *
+ * Token format (compatible with friendly-challenge v0.9.12):
+ *   "<signature>.<puzzleBase64>.<solutionBase64>.<diagnosticsBase64>"
+ *
+ * @param {string}     signature      - hex signature from the puzzle string
+ * @param {string}     puzzleBase64   - base64 puzzle data (second part of puzzle string)
+ * @param {Uint8Array} solutionBuffer - numPuzzles × 8 bytes (one 8-byte nonce per sub-puzzle)
+ * @param {Uint8Array} diagnostics    - 3-byte diagnostics buffer
+ * @returns {string} the frc-captcha-solution token
+ */
+function buildSolutionToken(signature, puzzleBase64, solutionBuffer, diagnostics) {
+  const solutionBase64   = Buffer.from(solutionBuffer).toString('base64');
+  const diagnosticsBase64 = Buffer.from(diagnostics).toString('base64');
+  return `${signature}.${puzzleBase64}.${solutionBase64}.${diagnosticsBase64}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -432,7 +519,7 @@ if (!isMainThread) {
   /**
    * Initialises the best available solver (WASM first, then JS) and posts a
    * 'ready' message to the parent thread.
-   * @returns {Promise<Function>} the solver function
+   * @returns {Promise<{ solver: Function, solverID: number }>}
    */
   async function initSolver() {
     try {
@@ -440,32 +527,33 @@ if (!isMainThread) {
       const wasmBytes = fs.readFileSync(wasmPath);
       const solver    = await createWasmSolver(wasmBytes);
       parentPort.postMessage({ type: 'ready', solverEngine: 'wasm' });
-      return solver;
+      return { solver, solverID: SOLVER_ID_WASM };
     } catch (wasmError) {
       process.stderr.write(
         `[cap] WASM solver unavailable, using JS fallback: ${wasmError.message}\n`
       );
       const solver = createJsSolver();
       parentPort.postMessage({ type: 'ready', solverEngine: 'js' });
-      return solver;
+      return { solver, solverID: SOLVER_ID_JS };
     }
   }
 
-  const solverPromise = initSolver();
+  const solverInitPromise = initSolver();
 
   parentPort.on('message', async (msg) => {
     if (msg.type !== 'solve') return;
 
     try {
-      const solver = await solverPromise;
+      const { solver, solverID } = await solverInitPromise;
       const { solverInput, threshold, puzzleIndex, numPuzzles } = msg;
 
-      let solvedInput = null;
+      let solvedInput    = null;
       let totalHashCount = 0;
 
-      // Outer loop: iterate byte 123 (0–255) as an additional nonce dimension
+      // Outer loop: iterate byte 123 (0–255) as an additional nonce dimension.
+      // Matches the outer loop in the original WebWorker cap.js.
       for (let outerNonce = 0; outerNonce < 256; outerNonce++) {
-        solverInput[123] = outerNonce;
+        solverInput[OUTER_NONCE_BYTE] = outerNonce;
         const [updatedInput, hashBytes] = solver(solverInput, threshold);
 
         if (hashBytes.length > 0) {
@@ -485,21 +573,28 @@ if (!isMainThread) {
         return;
       }
 
-      // Add the final inner-counter value to get total hashes computed
+      // Add the final inner-counter value to get total hashes computed.
+      // Matches: g += new DataView(I.slice(-4).buffer).getUint32(0, true)
       const finalCounterView = new DataView(
-        solvedInput.buffer, solvedInput.byteOffset + 124, 4
+        solvedInput.buffer, solvedInput.byteOffset + INNER_NONCE_OFFSET, 4
       );
       totalHashCount += finalCounterView.getUint32(0, /*littleEndian=*/true);
 
-      // The solution nonce is the last 8 bytes of the solver input (bytes 120–127)
-      const solutionNonce = Buffer.from(solvedInput.slice(-8)).toString('base64');
+      // The solution nonce is bytes 120–127 of the solved input:
+      //   byte 120: puzzle index
+      //   bytes 121–122: zeros
+      //   byte 123: outer nonce that succeeded
+      //   bytes 124–127: inner counter value that produced hash < threshold
+      // This matches `solution: I.slice(-8)` in the original WebWorker.
+      const solutionSegment = Buffer.from(solvedInput.slice(PUZZLE_INDEX_BYTE, SOLVER_INPUT_SIZE));
 
       parentPort.postMessage({
         type: 'done',
-        solutionNonce,      // base64-encoded 8-byte nonce
-        totalHashCount,     // total Blake2b hashes computed
-        puzzleIndex,        // which puzzle index this solves (0-based)
-        numPuzzles          // total number of puzzles in this challenge
+        solutionSegment,      // 8-byte Buffer (bytes 120–127 of the solved input)
+        solverID,             // SOLVER_ID_JS or SOLVER_ID_WASM
+        totalHashCount,       // total Blake2b hashes computed
+        puzzleIndex,          // which sub-puzzle this solves (0-based)
+        numPuzzles            // total number of sub-puzzles in this challenge
       });
     } catch (err) {
       parentPort.postMessage({ type: 'error', message: err.message });
@@ -540,24 +635,26 @@ if (isMainThread) {
             reject(new Error(`Failed to parse API response: ${e.message}`));
           }
         });
-      }).on('error', reject);
+      });
+      req.on('error', reject);
     });
   }
 
   /**
-   * Spawns a Worker Thread to solve a single puzzle index.
+   * Spawns a Worker Thread to solve one sub-puzzle.
    *
-   * @param {Uint8Array} solverInput  - 128-byte solver input (shared across puzzles)
-   * @param {number}     threshold    - hash threshold
-   * @param {number}     puzzleIndex  - which puzzle to solve (0-based)
-   * @param {number}     numPuzzles   - total number of puzzles
+   * @param {Uint8Array} baseSolverInput - 128-byte solver input (puzzle buffer at 0–31)
+   * @param {number}     threshold       - hash threshold
+   * @param {number}     puzzleIndex     - sub-puzzle index (0-based)
+   * @param {number}     numPuzzles      - total sub-puzzles in the challenge
    * @returns {Promise<Object>} the 'done' message from the worker
    */
-  function runWorkerSolver(solverInput, threshold, puzzleIndex, numPuzzles) {
+  function runWorkerSolver(baseSolverInput, threshold, puzzleIndex, numPuzzles) {
     return new Promise((resolve, reject) => {
       // Each worker gets its own copy of the solver input so they can modify
-      // it independently without interfering with each other.
-      const inputCopy = new Uint8Array(solverInput);
+      // it independently (outer/inner nonce bytes) without interfering.
+      const solverInput = new Uint8Array(baseSolverInput);
+      solverInput[PUZZLE_INDEX_BYTE] = puzzleIndex; // byte 120 = puzzle index
 
       const worker = new Worker(__filename);
 
@@ -570,7 +667,7 @@ if (isMainThread) {
         switch (msg.type) {
           case 'ready':
             // Worker has initialised its solver; send the solve request
-            worker.postMessage({ type: 'solve', solverInput: inputCopy, threshold, puzzleIndex, numPuzzles });
+            worker.postMessage({ type: 'solve', solverInput, threshold, puzzleIndex, numPuzzles });
             break;
           case 'done':
             resolve(msg);
@@ -586,27 +683,50 @@ if (isMainThread) {
   }
 
   /**
-   * Solves a raw puzzle string using one Worker Thread per sub-puzzle.
+   * Solves a raw puzzle string and returns the `frc-captcha-solution` token.
+   *
+   * All sub-puzzles are solved concurrently (one Worker Thread each).
    *
    * @param {string} puzzleString - the raw puzzle string from the API
-   * @returns {Promise<Array<Object>>} array of solve results, one per sub-puzzle
+   * @returns {Promise<string>} the frc-captcha-solution token ready for form submission
    */
   async function solvePuzzleString(puzzleString) {
-    const { solverInput, threshold, numPuzzles } = parsePuzzle(puzzleString);
+    const { signature, puzzleBase64, baseSolverInput, threshold, numPuzzles } =
+      parsePuzzle(puzzleString);
 
-    // Solve each sub-puzzle concurrently in its own worker thread
-    const solvePromises = Array.from({ length: numPuzzles }, (_, i) =>
-      runWorkerSolver(solverInput, threshold, i, numPuzzles)
+    const startTime = Date.now();
+
+    // Solve all sub-puzzles concurrently, one worker per sub-puzzle
+    const workerResults = await Promise.all(
+      Array.from({ length: numPuzzles }, (_, i) =>
+        runWorkerSolver(baseSolverInput, threshold, i, numPuzzles)
+      )
     );
 
-    return Promise.all(solvePromises);
+    const totalSeconds = (Date.now() - startTime) / 1000;
+
+    // Assemble the solution buffer: 8 bytes per sub-puzzle in index order
+    const solutionBuffer = new Uint8Array(numPuzzles * 8);
+    let   totalHashCount = 0;
+    let   solverID       = SOLVER_ID_WASM; // downgrade to JS if any worker used JS
+
+    for (const result of workerResults) {
+      solutionBuffer.set(result.solutionSegment, result.puzzleIndex * 8);
+      totalHashCount += result.totalHashCount;
+      if (result.solverID === SOLVER_ID_JS) solverID = SOLVER_ID_JS;
+    }
+
+    const diagnostics = buildDiagnosticsBuffer(solverID, totalSeconds);
+    const token       = buildSolutionToken(signature, puzzleBase64, solutionBuffer, diagnostics);
+
+    return token;
   }
 
   /**
-   * Fetches a puzzle from the API and solves it.
+   * Fetches a puzzle from the API and solves it, returning the frc-captcha-solution token.
    *
    * @param {string} siteKey - the FriendlyCaptcha site key
-   * @returns {Promise<Array<Object>>} solve results
+   * @returns {Promise<string>} the frc-captcha-solution token
    */
   async function fetchAndSolvePuzzle(siteKey) {
     const puzzleString = await fetchPuzzle(siteKey);
@@ -615,7 +735,14 @@ if (isMainThread) {
   }
 
   // ── Module export ──────────────────────────────────────────────────────────
-  module.exports = { fetchAndSolvePuzzle, solvePuzzleString, fetchPuzzle, parsePuzzle };
+  module.exports = {
+    fetchAndSolvePuzzle,
+    solvePuzzleString,
+    fetchPuzzle,
+    parsePuzzle,
+    buildSolutionToken,
+    difficultyToThreshold
+  };
 
   // ── CLI entry point ────────────────────────────────────────────────────────
   if (require.main === module) {
@@ -625,11 +752,9 @@ if (isMainThread) {
     console.log(`[cap] Solving FriendlyCaptcha puzzle for sitekey: ${siteKey}`);
 
     fetchAndSolvePuzzle(siteKey)
-      .then((results) => {
-        console.log('[cap] Solution(s):');
-        for (const result of results) {
-          console.log(`  puzzle[${result.puzzleIndex}]: nonce=${result.solutionNonce}  hashes=${result.totalHashCount}`);
-        }
+      .then((token) => {
+        console.log('[cap] frc-captcha-solution token:');
+        console.log(token);
         process.exit(0);
       })
       .catch((err) => {

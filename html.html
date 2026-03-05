@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FriendlyCaptcha Demo</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 40px auto; padding: 0 16px; }
+    label { display: block; margin-top: 12px; font-weight: bold; }
+    input[type="text"], input[type="password"] {
+      display: block; width: 100%; box-sizing: border-box;
+      padding: 8px; margin-top: 4px; border: 1px solid #ccc; border-radius: 4px;
+    }
+    button[type="submit"] {
+      margin-top: 16px; padding: 10px 24px; background: #222; color: #fff;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 14px;
+    }
+    button[type="submit"]:hover { background: #444; }
+    #token-display {
+      margin-top: 24px; padding: 12px; background: #f4f4f4;
+      border: 1px solid #ddd; border-radius: 4px; word-break: break-all;
+      font-family: monospace; font-size: 12px; display: none;
+    }
+    #token-display strong { display: block; margin-bottom: 4px; }
+    #status { margin-top: 8px; font-size: 13px; color: #555; }
+  </style>
+
+  <!--
+    FriendlyCaptcha widget (v0.9.12)
+    After solving the puzzle the widget automatically injects:
+      <input type="hidden" name="frc-captcha-solution" value="<token>">
+
+    Token format:
+      <signature>.<puzzleBase64>.<solutionBase64>.<diagnosticsBase64>
+
+    The Node.js solver in cap.js produces this same token format so that
+    you can bypass the browser widget entirely for automated workflows.
+  -->
+  <script type="module"
+    src="https://cdn.jsdelivr.net/npm/friendly-challenge@0.9.12/widget.module.min.js"
+    async defer></script>
+  <script nomodule
+    src="https://cdn.jsdelivr.net/npm/friendly-challenge@0.9.12/widget.min.js"
+    async defer></script>
+</head>
+<body>
+  <h2>Login</h2>
+  <p>This page demonstrates the FriendlyCaptcha widget and the <code>frc-captcha-solution</code> token it produces.</p>
+
+  <form id="login-form" method="POST" action="/login">
+    <label for="username">Username</label>
+    <input type="text" id="username" name="username" placeholder="Enter username" required>
+
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" placeholder="Enter password" required>
+
+    <!--
+      FriendlyCaptcha widget
+        data-sitekey   — your FriendlyCaptcha site key
+        data-callback  — JavaScript function to call when the puzzle is solved
+    -->
+    <div class="frc-captcha"
+         data-sitekey="FCMSPLFFSPQ6TH80"
+         data-callback="onCaptchaSolved">
+    </div>
+
+    <p id="status">⏳ Waiting for captcha…</p>
+
+    <button type="submit">Log in</button>
+  </form>
+
+  <!--
+    Display the frc-captcha-solution token for inspection / debugging.
+    In production you would just let the form submit normally.
+  -->
+  <div id="token-display">
+    <strong>frc-captcha-solution token (copy this for the Node.js solver):</strong>
+    <span id="token-value"></span>
+  </div>
+
+  <script>
+    /**
+     * Called by the FriendlyCaptcha widget once the puzzle is solved.
+     * The widget has already set the hidden input value at this point.
+     */
+    function onCaptchaSolved() {
+      var hiddenInput = document.querySelector('[name="frc-captcha-solution"]');
+      var token = hiddenInput ? hiddenInput.value : '(not found)';
+
+      document.getElementById('status').textContent = '✅ Captcha solved!';
+
+      var display = document.getElementById('token-display');
+      document.getElementById('token-value').textContent = token;
+      display.style.display = 'block';
+
+      console.log('[frc] frc-captcha-solution:', token);
+    }
+
+    /**
+     * Guard against submitting the form before the captcha is solved.
+     * The widget uses these sentinel values for the hidden input while busy:
+     *   .UNSTARTED  — widget not yet initialised
+     *   .FETCHING   — fetching the puzzle from the API
+     *   .UNFINISHED — solving the puzzle
+     */
+    document.getElementById('login-form').addEventListener('submit', function (e) {
+      var hiddenInput = document.querySelector('[name="frc-captcha-solution"]');
+      if (!hiddenInput) {
+        e.preventDefault();
+        alert('FriendlyCaptcha widget not loaded. Check your internet connection.');
+        return;
+      }
+
+      var pendingValues = ['.UNSTARTED', '.FETCHING', '.UNFINISHED', '.ERROR'];
+      if (pendingValues.indexOf(hiddenInput.value) !== -1) {
+        e.preventDefault();
+        alert('Please wait for the captcha to finish before submitting.');
+        return;
+      }
+    });
+  </script>
+
+  <hr style="margin-top: 40px">
+  <h3>Using the Node.js Solver (cap.js)</h3>
+  <p>
+    The <code>cap.js</code> solver produces the same <code>frc-captcha-solution</code> token
+    as the browser widget, so you can automate form submissions server-side:
+  </p>
+  <pre style="background:#f4f4f4;padding:12px;border-radius:4px;overflow-x:auto">
+// Fetch a puzzle and solve it in one call:
+const { fetchAndSolvePuzzle } = require('./cap');
+
+const token = await fetchAndSolvePuzzle('FCMSPLFFSPQ6TH80');
+// token = "f7b1…833.aanq….AAAAAE8mAAA=.AgAA"
+
+// Submit to your target URL with the token:
+await fetch('https://example.com/login', {
+  method: 'POST',
+  body: new URLSearchParams({
+    username: 'alice',
+    password: 'secret',
+    'frc-captcha-solution': token,
+  }),
+});
+
+// Or solve an already-fetched puzzle string:
+const { solvePuzzleString } = require('./cap');
+const token2 = await solvePuzzleString('REPLACE_WITH_ACTUAL_PUZZLE_STRING');
+  </pre>
+
+  <h4>Token format</h4>
+  <p>
+    The <code>frc-captcha-solution</code> token is a dot-separated string with four parts:
+  </p>
+  <pre style="background:#f4f4f4;padding:12px;border-radius:4px;overflow-x:auto">
+&lt;signature&gt;.&lt;puzzleBase64&gt;.&lt;solutionBase64&gt;.&lt;diagnosticsBase64&gt;
+
+signature       — hex string identifying the account key
+puzzleBase64    — the base64 puzzle data from the API response
+solutionBase64  — base64( 8 bytes × numPuzzles ) nonces that satisfy hash &lt; threshold
+diagnosticsBase64 — base64( [solverID, timeHigh, timeLow] ) — 3 bytes
+  </pre>
+</body>
+</html>

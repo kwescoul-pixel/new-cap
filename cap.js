@@ -4,7 +4,7 @@
  * FriendlyCaptcha Puzzle Solver — Node.js implementation
  *
  * Solves FriendlyCaptcha proof-of-work puzzles using Blake2b-256.
- * Uses WebAssembly for speed, with a pure-JS fallback.
+ * Uses the native JavaScript solver (no WebAssembly).
  * The heavy computation runs in a Node.js Worker Thread so the main
  * thread stays non-blocking.
  *
@@ -19,9 +19,7 @@
  */
 
 const { Worker, isMainThread, parentPort } = require('worker_threads');
-const path = require('path');
 const https = require('https');
-const fs = require('fs');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Blake2b — pure JavaScript implementation (32-bit arithmetic on 64-bit words)
@@ -517,34 +515,22 @@ function buildSolutionToken(signature, puzzleBase64, solutionBuffer, diagnostics
 
 if (!isMainThread) {
   /**
-   * Initialises the best available solver (WASM first, then JS) and posts a
-   * 'ready' message to the parent thread.
-   * @returns {Promise<{ solver: Function, solverID: number }>}
+   * Initialises the native JS solver and posts a 'ready' message to the parent thread.
+   * @returns {{ solver: Function, solverID: number }}
    */
-  async function initSolver() {
-    try {
-      const wasmPath  = path.join(__dirname, 'wasm', 'solver.wasm');
-      const wasmBytes = fs.readFileSync(wasmPath);
-      const solver    = await createWasmSolver(wasmBytes);
-      parentPort.postMessage({ type: 'ready', solverEngine: 'wasm' });
-      return { solver, solverID: SOLVER_ID_WASM };
-    } catch (wasmError) {
-      process.stderr.write(
-        `[cap] WASM solver unavailable, using JS fallback: ${wasmError.message}\n`
-      );
-      const solver = createJsSolver();
-      parentPort.postMessage({ type: 'ready', solverEngine: 'js' });
-      return { solver, solverID: SOLVER_ID_JS };
-    }
+  function initSolver() {
+    const solver = createJsSolver();
+    parentPort.postMessage({ type: 'ready', solverEngine: 'js' });
+    return { solver, solverID: SOLVER_ID_JS };
   }
 
-  const solverInitPromise = initSolver();
+  const solverInitResult = initSolver();
 
   parentPort.on('message', async (msg) => {
     if (msg.type !== 'solve') return;
 
     try {
-      const { solver, solverID } = await solverInitPromise;
+      const { solver, solverID } = solverInitResult;
       const { solverInput, threshold, puzzleIndex, numPuzzles } = msg;
 
       let solvedInput    = null;

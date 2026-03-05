@@ -848,17 +848,22 @@ if (isMainThread) {
 
     // Solve all sub-puzzles concurrently, one worker per sub-puzzle.
     // Each .then() logs per-puzzle completion as soon as a worker finishes.
+    let solvedCount = 0;
     const workerResults = await Promise.all(
       Array.from({ length: numPuzzles }, (_, i) =>
         runWorkerSolver(baseSolverInput, threshold, i, numPuzzles).then((result) => {
+          solvedCount++;
           const ms   = result.solveMs;
           const rate = ms > 0 ? Math.round(result.totalHashCount / (ms / 1000)) : Infinity;
           const rateStr = rate === Infinity ? '∞' : rate >= 1e6
             ? `${(rate / 1e6).toFixed(2)}M`
             : `${(rate / 1e3).toFixed(0)}K`;
+          const remaining = numPuzzles - solvedCount;
+          const remainingStr = remaining > 0 ? `, ${remaining} still running` : ', all done';
           process.stderr.write(
             `[cap] Puzzle ${result.puzzleIndex + 1}/${numPuzzles} solved` +
-            ` | ${ms}ms | ${result.totalHashCount.toLocaleString()} hashes | ${rateStr} h/s\n`
+            ` | ${ms}ms | ${result.totalHashCount.toLocaleString()} hashes | ${rateStr} h/s` +
+            ` | ${solvedCount}/${numPuzzles} total${remainingStr}\n`
           );
           return result;
         })
@@ -926,7 +931,7 @@ if (isMainThread) {
 
     fetchAndSolvePuzzle(siteKey)
       .then((token) => {
-        process.stderr.write('[cap] frc-captcha-solution token:\n');
+        process.stderr.write(`[cap] frc-captcha-solution: ${token}\n`);
         console.log(token); // token goes to stdout for easy piping
         process.exit(0);
       })

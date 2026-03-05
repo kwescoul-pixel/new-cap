@@ -89,6 +89,25 @@ const STATIC_V_LO = (() => {
   return a;
 })();
 
+/**
+ * Pre-computed full constant initial working vector (v[0..31] before any message mixing).
+ *
+ * For every single-block Blake2b-256 hash the initial working vector is constant:
+ *   v[0..15]  = IVs XOR'd with parameter block  (h_init, same for all hashes)
+ *   v[16..31] = STATIC_V_LO                     (IVs + counter/flags already baked in)
+ *
+ * Using a single Uint32Array.set() call to reset v from this array is measurably
+ * faster than two separate 16-element loops because V8 can lower it to a native
+ * memcpy, eliminating per-element bounds checks and loop overhead.
+ */
+const STATIC_V_FULL = (() => {
+  const a = new Uint32Array(32);
+  for (let i = 0; i < 16; i++) a[i] = BLAKE2B_IV32[i];
+  a[0] ^= 0x01010000 ^ BLAKE2B_256_DIGEST_SIZE; // parameter block: digest length, key=0
+  for (let i = 0; i < 16; i++) a[i + 16] = STATIC_V_LO[i];
+  return a;
+})();
+
 /** Holds the mutable state for one Blake2b-256 computation. */
 class Blake2bState {
   /**
@@ -344,55 +363,48 @@ function wrapAssemblyScriptExports(wasmExports) {
 /**
  * Creates an optimised pure-JS Blake2b solver function.
  *
- * Two hot-path optimisations compared to a naïve implementation:
+ * Hot-path optimisations:
  *
- *  1. Static message words pre-loaded — the 128-byte solver input has 31 of its
- *     32 uint32 message words (m[0]..m[30], bytes 0–123) that are constant for
- *     the entire inner solve loop.  Only m[31] (bytes 124–127, the inner nonce
- *     counter) changes per iteration.  Loading the constant 31 words once
- *     before the loop avoids 31 × readUint32LE calls and a 128-byte buffer copy
- *     on every hash.
+ *  1. Static message words pre-loaded — only m[31] (bytes 124–127, the inner
+ *     nonce counter) is updated per iteration.  Loading the constant 31 words
+ *     once before the loop avoids 31 × readUint32LE calls per hash.
  *
- *  2. Pre-computed working vector lower half (STATIC_V_LO) — for all single-block
- *     finalized hashes the lower half of the working vector is identical.  Using
- *     the pre-computed constant saves 3 ops (one XOR + two NOT) per hash.
+ *  2. STATIC_V_FULL fast-reset — the full 32-element constant initial working
+ *     vector is reset in one Uint32Array.set() call (native memcpy), eliminating
+ *     the per-iteration h[] re-init loop and two separate 16-element copy loops.
+ *
+ *  3. End-counter write-back on failure — when no solution is found in the
+ *     requested range, the function writes the next counter value back into
+ *     inputBuffer bytes 124–127.  This lets the caller resume with a fresh
+ *     jsSolve() call without needing to track the counter externally.
  *
  * @returns {Function} (inputBuffer, threshold, maxIterations?) => [inputBuffer, hashBytes]
  */
 function createJsSolver() {
-  const h = new Uint32Array(16); // hash state (re-initialised each hash)
-  const v = new Uint32Array(32); // working vector
+  const v = new Uint32Array(32); // working vector (reset from STATIC_V_FULL each hash)
   const m = new Uint32Array(32); // message schedule
+
+  // Cache the first element of the constant initial working vector as a JS local.
+  // This avoids one typed-array read on the early-exit check for every failed hash.
+  const initV0 = STATIC_V_FULL[0];
 
   return function jsSolve(inputBuffer, threshold, maxIterations = 0xFFFFFFFF) {
     if (inputBuffer.length !== 128) throw new Error('Solver input must be exactly 128 bytes');
 
-    // Pre-load the 31 static message words (bytes 0–123).
+    // Pre-load the 31 static message words (bytes 0–123) once per jsSolve call.
     // Only m[31] (bytes 124–127, the inner nonce counter) changes per iteration.
     for (let i = 0; i < 31; i++) m[i] = readUint32LE(inputBuffer, 4 * i);
 
     const view         = new DataView(inputBuffer.buffer, inputBuffer.byteOffset, 128);
     const startCounter = view.getUint32(124, /*littleEndian=*/true);
-    // endCounter may exceed 32-bit range; that is intentional — the counter value
-    // stored in m[31] wraps naturally inside the 32-bit Uint32Array slot.
-    const endCounter   = startCounter + maxIterations;
+    const endCounter   = startCounter + maxIterations; // may exceed uint32; wraps in m[31]
 
     for (let counter = startCounter; counter < endCounter; counter++) {
-      // Only the counter word changes — no need to copy the full 128-byte buffer.
-      m[31] = counter;
+      m[31] = counter; // update only the changing counter word
 
-      // Re-initialise hash state from IVs + Blake2b-256 parameter block word.
-      for (let i = 0; i < 16; i++) h[i] = BLAKE2B_IV32[i];
-      h[0] ^= 0x01010000 ^ BLAKE2B_256_DIGEST_SIZE; // parameter block: digest length
-
-      // Initialise working vector:
-      //   v[0..15]  = current hash state h[0..15]
-      //   v[16..31] = STATIC_V_LO (pre-computed IV with byte-counter XOR and
-      //               finalization flags already baked in)
-      for (let i = 0; i < 16; i++) {
-        v[i]      = h[i];
-        v[i + 16] = STATIC_V_LO[i];
-      }
+      // Reset working vector from pre-computed constant in a single bulk copy
+      // (V8 lowers TypedArray.set() to a native memcpy when types match).
+      v.set(STATIC_V_FULL);
 
       // 12 compression rounds (column + diagonal mixing)
       for (let round = 0; round < 12; round++) {
@@ -410,17 +422,22 @@ function createJsSolver() {
         blake2bMix(v, m,  6,  8, 18, 28, s[base + 14], s[base + 15]);
       }
 
-      // Finalise: XOR working vector back into hash state
-      for (let i = 0; i < 16; i++) h[i] ^= v[i] ^ v[i + 16];
-
-      if (h[0] < threshold) {
-        // Write the winning counter back into the input buffer so the caller
-        // can read bytes 124–127 as the nonce.
+      // Check only word 0 of the hash before computing all 16 — nearly all
+      // iterations fail here, so this avoids 15 XOR operations for each miss.
+      // h[0] = STATIC_V_FULL[0] ^ v[0] ^ v[16]
+      // NOTE: JavaScript XOR (^) returns a signed int32; >>> 0 converts to
+      // unsigned uint32 before comparing with the unsigned threshold value.
+      if (((initV0 ^ v[0] ^ v[16]) >>> 0) < threshold) {
         view.setUint32(124, counter, /*littleEndian=*/true);
-        return [inputBuffer, new Uint8Array(h.buffer)];
+        // Compute the full 32-byte hash output (only on success)
+        const hashOut = new Uint32Array(16);
+        for (let i = 0; i < 16; i++) hashOut[i] = STATIC_V_FULL[i] ^ v[i] ^ v[i + 16];
+        return [inputBuffer, new Uint8Array(hashOut.buffer)];
       }
     }
 
+    // Write the end-counter back so the caller can resume without external tracking.
+    view.setUint32(124, endCounter >>> 0, /*littleEndian=*/true);
     return [inputBuffer, new Uint8Array(0)]; // no solution found in this range
   };
 }
@@ -625,24 +642,53 @@ if (!isMainThread) {
 
       try {
         const { solverInput, threshold, puzzleIndex, numPuzzles } = msg;
-        const solveStart   = Date.now();
+        const solveStart = Date.now();
+
+        // Number of hashes per jsSolve() call.  Small enough to yield the event
+        // loop between batches (so progress messages are actually delivered) yet
+        // large enough to amortise per-call overhead.
+        const BATCH_SIZE = 500_000;
 
         let solvedInput    = null;
-        let totalHashCount = 0;
+        let totalHashCount = 0; // hashes from fully exhausted outer-nonce passes
 
         // Outer loop: iterate byte 123 (0–255) as an additional nonce dimension.
-        // Matches the outer loop in the original WebWorker cap.js.
-        for (let outerNonce = 0; outerNonce < 256; outerNonce++) {
+        outer: for (let outerNonce = 0; outerNonce < 256; outerNonce++) {
           solverInput[OUTER_NONCE_BYTE] = outerNonce;
-          const [updatedInput, hashBytes] = solver(solverInput, threshold);
 
-          if (hashBytes.length > 0) {
-            solvedInput = updatedInput;
-            break;
+          // Reset the inner counter to 0 at the start of each outer nonce pass.
+          // jsSolve() writes the end-counter back on failure, so subsequent
+          // batches automatically continue from where the previous one left off.
+          const innerView = new DataView(solverInput.buffer, solverInput.byteOffset, 128);
+          innerView.setUint32(INNER_NONCE_OFFSET, 0, /*littleEndian=*/true);
+
+          let innerRemaining = 0x100000000; // 2^32 counter values per outer nonce (0..0xFFFFFFFF)
+          while (innerRemaining > 0) {
+            const batchSize = Math.min(BATCH_SIZE, innerRemaining);
+            const [updatedInput, hashBytes] = solver(solverInput, threshold, batchSize);
+
+            if (hashBytes.length > 0) {
+              solvedInput = updatedInput;
+              break outer;
+            }
+
+            innerRemaining -= batchSize;
+            // After a failed batch, jsSolve() wrote the next counter into
+            // solverInput[124..127], so the next call continues correctly.
+
+            // Report progress with the true cumulative hash count:
+            // totalHashCount = hashes from previous outer-nonce passes
+            // (0x100000000 - innerRemaining) = hashes tested in this outer-nonce pass
+            parentPort.postMessage({
+              type:          'progress',
+              puzzleIndex,
+              totalHashCount: totalHashCount + (0x100000000 - innerRemaining),
+              elapsedMs:     Date.now() - solveStart
+            });
           }
 
-          // Accumulate work: this pass exhausted 2^32 - 1 counter values
-          totalHashCount += 0xFFFFFFFF;
+          // This outer-nonce pass was fully exhausted; add all 2^32 hashes.
+          totalHashCount += 0x100000000;
         }
 
         if (solvedInput === null) {
@@ -653,11 +699,12 @@ if (!isMainThread) {
           return;
         }
 
-        // Add the final inner-counter value to get total hashes computed.
+        // The absolute inner-counter value at the solution is the exact number of
+        // hashes tested in this outer-nonce pass (zero-indexed + 1).
         const finalCounterView = new DataView(
           solvedInput.buffer, solvedInput.byteOffset + INNER_NONCE_OFFSET, 4
         );
-        totalHashCount += finalCounterView.getUint32(0, /*littleEndian=*/true);
+        totalHashCount += finalCounterView.getUint32(0, /*littleEndian=*/true) + 1;
 
         // The solution nonce is bytes 120–127 of the solved input:
         //   byte 120: puzzle index
@@ -752,6 +799,19 @@ if (isMainThread) {
             // Worker has initialised its solver; send the solve request
             worker.postMessage({ type: 'solve', solverInput, threshold, puzzleIndex, numPuzzles });
             break;
+          case 'progress': {
+            const ms   = msg.elapsedMs;
+            const rate = ms > 0 ? Math.round(msg.totalHashCount / (ms / 1000)) : Infinity;
+            const rateStr = rate >= 1e6
+              ? `${(rate / 1e6).toFixed(2)}M`
+              : `${(rate / 1e3).toFixed(0)}K`;
+            process.stderr.write(
+              `[cap] Puzzle ${msg.puzzleIndex + 1}/${numPuzzles} ...` +
+              ` ${msg.totalHashCount.toLocaleString()} hashes, ${Math.round(ms / 1000)}s elapsed` +
+              ` (${rateStr} h/s)\n`
+            );
+            break;
+          }
           case 'done':
             resolve(msg);
             worker.terminate();

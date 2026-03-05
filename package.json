@@ -1,7 +1,7 @@
 {
   "name": "new-cap",
   "version": "1.0.0",
-  "description": "FriendlyCaptcha puzzle solver for Node.js — optimised pure-JS Blake2b (WASM opt-in via FRC_USE_WASM=1) with native Worker Threads",
+  "description": "FriendlyCaptcha puzzle solver for Node.js — WASM-accelerated Blake2b with Worker Threads and axios",
   "main": "cap.js",
   "scripts": {
     "start": "node cap.js"
@@ -9,6 +9,15 @@
   "engines": {
     "node": ">=12.0.0"
   },
-  "keywords": ["friendlycaptcha", "captcha", "blake2b", "wasm", "worker-threads"],
-  "license": "MIT"
+  "keywords": [
+    "friendlycaptcha",
+    "captcha",
+    "blake2b",
+    "wasm",
+    "worker-threads"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.13.6"
+  }
 }

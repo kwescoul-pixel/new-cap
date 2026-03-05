@@ -4,8 +4,8 @@
  * FriendlyCaptcha Puzzle Solver — Node.js implementation
  *
  * Solves FriendlyCaptcha proof-of-work puzzles using Blake2b-256.
- * Uses the optimised pure-JavaScript solver by default — set the environment
- * variable FRC_USE_WASM=1 to switch to the bundled WebAssembly solver instead.
+ * Uses the bundled WebAssembly solver by default for maximum throughput —
+ * set FRC_USE_WASM=0 to fall back to the pure-JavaScript solver instead.
  * The heavy computation runs in a Node.js Worker Thread per sub-puzzle so all
  * sub-puzzles are solved concurrently and the main thread stays non-blocking.
  *
@@ -23,7 +23,7 @@ const { Worker, isMainThread, parentPort } = require('worker_threads');
 const fs    = require('fs');
 const os    = require('os');
 const path  = require('path');
-const https = require('https');
+const axios = require('axios');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Blake2b — pure JavaScript implementation (32-bit arithmetic on 64-bit words)
@@ -544,10 +544,21 @@ function parsePuzzle(puzzleString) {
 
   const puzzleBuffer = Buffer.from(puzzleBase64, 'base64');
 
+  const MIN_PUZZLE_BUFFER_LEN = 16;
+  if (puzzleBuffer.length < MIN_PUZZLE_BUFFER_LEN) {
+    throw new Error(
+      `Puzzle buffer too short: expected at least ${MIN_PUZZLE_BUFFER_LEN} bytes, got ${puzzleBuffer.length}`
+    );
+  }
+
   const numPuzzles     = puzzleBuffer[PUZZLE_NUM_PUZZLES_OFFSET];
   const difficultyByte = puzzleBuffer[PUZZLE_DIFFICULTY_OFFSET];
   const expiryMs       = puzzleBuffer[PUZZLE_EXPIRY_OFFSET] * 300_000;
   const threshold      = difficultyToThreshold(difficultyByte);
+
+  if (numPuzzles < 1) {
+    throw new Error(`Invalid puzzle: numPuzzles must be at least 1, got ${numPuzzles}`);
+  }
 
   // Build the base 128-byte solver input: puzzle buffer at bytes 0–31, rest zeros.
   // Each sub-puzzle gets its own copy with byte 120 set to the puzzle index.
@@ -610,17 +621,14 @@ if (!isMainThread) {
   /**
    * Initialises the solver for this worker thread.
    *
-   * The native JavaScript solver is used by default — it is consistently faster
-   * in most Node.js environments for this workload because the WASM JIT warm-up
-   * overhead outweighs the throughput advantage at typical puzzle difficulties.
-   *
-   * To opt into the WASM solver instead, set the environment variable:
-   *   FRC_USE_WASM=1
+   * The WebAssembly solver is used by default for maximum throughput.
+   * Set the environment variable FRC_USE_WASM=0 to fall back to the pure-JS
+   * solver (useful for environments where WASM is unavailable or restricted).
    *
    * @returns {Promise<{ solver: Function, solverID: number, solverEngine: string }>}
    */
   async function initSolver() {
-    if (process.env.FRC_USE_WASM === '1') {
+    if (process.env.FRC_USE_WASM !== '0') {
       try {
         const wasmPath  = path.join(__dirname, 'wasm', 'solver.wasm');
         const wasmBytes = fs.readFileSync(wasmPath);
@@ -628,7 +636,7 @@ if (!isMainThread) {
         parentPort.postMessage({ type: 'ready', solverEngine: 'wasm' });
         return { solver, solverID: SOLVER_ID_WASM, solverEngine: 'wasm' };
       } catch (wasmErr) {
-        process.stderr.write(`[cap] FRC_USE_WASM=1 but WASM failed (${wasmErr.message}), using JS\n`);
+        process.stderr.write(`[cap] WASM solver unavailable (${wasmErr.message}), falling back to JS\n`);
       }
     }
 
@@ -748,27 +756,14 @@ if (isMainThread) {
    * @param {string} siteKey - the FriendlyCaptcha site key
    * @returns {Promise<string>} the raw puzzle string (e.g. "abc123.base64data==")
    */
-  function fetchPuzzle(siteKey) {
-    return new Promise((resolve, reject) => {
-      const url = `https://api.friendlycaptcha.com/api/v1/puzzle?sitekey=${encodeURIComponent(siteKey)}`;
-      const req = https.get(url, (res) => {
-        let rawBody = '';
-        res.on('data', (chunk) => { rawBody += chunk; });
-        res.on('end', () => {
-          try {
-            const json = JSON.parse(rawBody);
-            if (!json.success || !json.data || !json.data.puzzle) {
-              reject(new Error(`API error: ${rawBody}`));
-            } else {
-              resolve(json.data.puzzle);
-            }
-          } catch (e) {
-            reject(new Error(`Failed to parse API response: ${e.message}`));
-          }
-        });
-      });
-      req.on('error', reject);
-    });
+  async function fetchPuzzle(siteKey) {
+    const url = `https://api.friendlycaptcha.com/api/v1/puzzle?sitekey=${encodeURIComponent(siteKey)}`;
+    const response = await axios.get(url);
+    const json = response.data;
+    if (!json.success || !json.data || !json.data.puzzle) {
+      throw new Error(`API error: ${JSON.stringify(json)}`);
+    }
+    return json.data.puzzle;
   }
 
   /**
@@ -839,7 +834,7 @@ if (isMainThread) {
     const { signature, puzzleBase64, baseSolverInput, threshold, numPuzzles, difficultyByte } =
       parsePuzzle(puzzleString);
 
-    const engine = process.env.FRC_USE_WASM === '1' ? 'wasm' : 'js';
+    const engine = process.env.FRC_USE_WASM === '0' ? 'js' : 'wasm';
     // Limit concurrency to the number of logical CPU cores so each worker gets
     // a dedicated core and doesn't compete with siblings for CPU time.
     const numCores    = os.cpus().length;
@@ -952,7 +947,7 @@ if (isMainThread) {
     const siteKey = process.argv[2] || EXAMPLE_SITE_KEY;
 
     process.stderr.write(`[cap] FriendlyCaptcha solver — node cap.js [sitekey]\n`);
-    process.stderr.write(`[cap] Solver engine: ${process.env.FRC_USE_WASM === '1' ? 'wasm (FRC_USE_WASM=1)' : 'js (default)'}\n`);
+    process.stderr.write(`[cap] Solver engine: ${process.env.FRC_USE_WASM === '0' ? 'js (FRC_USE_WASM=0)' : 'wasm (default)'}\n`);
 
     fetchAndSolvePuzzle(siteKey)
       .then((token) => {

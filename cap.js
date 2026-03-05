@@ -21,6 +21,7 @@
 
 const { Worker, isMainThread, parentPort } = require('worker_threads');
 const fs    = require('fs');
+const os    = require('os');
 const path  = require('path');
 const https = require('https');
 
@@ -839,36 +840,60 @@ if (isMainThread) {
       parsePuzzle(puzzleString);
 
     const engine = process.env.FRC_USE_WASM === '1' ? 'wasm' : 'js';
+    // Limit concurrency to the number of logical CPU cores so each worker gets
+    // a dedicated core and doesn't compete with siblings for CPU time.
+    const numCores    = os.cpus().length;
+    const concurrency = Math.min(numPuzzles, numCores);
     process.stderr.write(
       `[cap] Solving ${numPuzzles} sub-puzzle(s) | difficulty ${difficultyByte}` +
-      ` | threshold 0x${threshold.toString(16).toUpperCase()} | engine: ${engine}\n`
+      ` | threshold 0x${threshold.toString(16).toUpperCase()} | engine: ${engine}` +
+      ` | concurrency: ${concurrency} of ${numCores} CPU core(s)\n`
     );
 
     const startTime = Date.now();
 
-    // Solve all sub-puzzles concurrently, one worker per sub-puzzle.
-    // Each .then() logs per-puzzle completion as soon as a worker finishes.
+    // Solve sub-puzzles with a bounded worker pool: at most `concurrency` workers
+    // run at the same time so each one gets a full CPU core.
+    // Results are collected in puzzle-index order for correct solution assembly.
+    const workerResults = new Array(numPuzzles);
     let solvedCount = 0;
-    const workerResults = await Promise.all(
-      Array.from({ length: numPuzzles }, (_, i) =>
-        runWorkerSolver(baseSolverInput, threshold, i, numPuzzles).then((result) => {
-          solvedCount++;
-          const ms   = result.solveMs;
-          const rate = ms > 0 ? Math.round(result.totalHashCount / (ms / 1000)) : Infinity;
-          const rateStr = rate === Infinity ? '∞' : rate >= 1e6
-            ? `${(rate / 1e6).toFixed(2)}M`
-            : `${(rate / 1e3).toFixed(0)}K`;
-          const remaining = numPuzzles - solvedCount;
-          const remainingStr = remaining > 0 ? `, ${remaining} still running` : ', all done';
-          process.stderr.write(
-            `[cap] Puzzle ${result.puzzleIndex + 1}/${numPuzzles} solved` +
-            ` | ${ms}ms | ${result.totalHashCount.toLocaleString()} hashes | ${rateStr} h/s` +
-            ` | ${solvedCount}/${numPuzzles} total${remainingStr}\n`
-          );
-          return result;
-        })
-      )
-    );
+    let nextIndex   = 0;
+
+    await new Promise((resolve, reject) => {
+      let active         = 0;
+      let completedCount = 0;
+
+      function dispatch() {
+        while (active < concurrency && nextIndex < numPuzzles) {
+          const i = nextIndex++;
+          active++;
+          runWorkerSolver(baseSolverInput, threshold, i, numPuzzles)
+            .then((result) => {
+              solvedCount++;
+              workerResults[result.puzzleIndex] = result;
+              const ms   = result.solveMs;
+              const rate = ms > 0 ? Math.round(result.totalHashCount / (ms / 1000)) : Infinity;
+              const rateStr = rate === Infinity ? '∞' : rate >= 1e6
+                ? `${(rate / 1e6).toFixed(2)}M`
+                : `${(rate / 1e3).toFixed(0)}K`;
+              const remaining = numPuzzles - solvedCount;
+              const remainingStr = remaining > 0 ? `, ${remaining} remaining` : ', all done';
+              process.stderr.write(
+                `[cap] Puzzle ${result.puzzleIndex + 1}/${numPuzzles} solved` +
+                ` | ${ms}ms | ${result.totalHashCount.toLocaleString()} hashes | ${rateStr} h/s` +
+                ` | ${solvedCount}/${numPuzzles} total${remainingStr}\n`
+              );
+              active--;
+              completedCount++;
+              if (completedCount === numPuzzles) resolve();
+              else dispatch();
+            })
+            .catch(reject);
+        }
+      }
+
+      dispatch();
+    });
 
     const totalMs = Date.now() - startTime;
 

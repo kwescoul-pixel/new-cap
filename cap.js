@@ -4,10 +4,10 @@
  * FriendlyCaptcha Puzzle Solver — Node.js implementation
  *
  * Solves FriendlyCaptcha proof-of-work puzzles using Blake2b-256.
- * Uses the bundled WebAssembly solver (wasm/solver.wasm) for maximum speed,
- * falling back automatically to the pure-JavaScript implementation if WASM is
- * unavailable.  The heavy computation runs in a Node.js Worker Thread so the
- * main thread stays non-blocking.
+ * Uses the optimised pure-JavaScript solver by default — set the environment
+ * variable FRC_USE_WASM=1 to switch to the bundled WebAssembly solver instead.
+ * The heavy computation runs in a Node.js Worker Thread per sub-puzzle so all
+ * sub-puzzles are solved concurrently and the main thread stays non-blocking.
  *
  * Token format (compatible with friendly-challenge v0.9.12 widget):
  *   frc-captcha-solution = "<signature>.<puzzleBase64>.<solutionBase64>.<diagnosticsBase64>"
@@ -63,6 +63,31 @@ const BLAKE2B_SIGMA = [
    0,  2,  4,  6,  8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, // round 10
   28, 20,  8, 16, 18, 30, 26, 12,  2, 24,  0,  4, 22, 14, 10,  6  // round 11
 ];
+
+/** Output size of Blake2b-256 in bytes. */
+const BLAKE2B_256_DIGEST_SIZE = 32;
+
+/** Size of the single full Blake2b block used as the solver input (128 bytes). */
+const SOLVER_INPUT_SIZE = 128;
+
+/**
+ * Pre-computed constant lower half of the Blake2b working vector (v[16..31]).
+ * For every single-block (128-byte) finalized hash the lower half is always:
+ *   v[16..31] = BLAKE2B_IV32
+ *   v[24]    ^= 128          (totalBytesHashed = 128, the only possible input size)
+ *   v[28]     = ~v[28]       (finalization flag — always set, single block)
+ *   v[29]     = ~v[29]       (finalization flag high word)
+ * Computing this once at module load instead of on every hash saves 3 ops per
+ * iteration and avoids an extra branch inside the hot loop.
+ */
+const STATIC_V_LO = (() => {
+  const a = new Uint32Array(16);
+  for (let i = 0; i < 16; i++) a[i] = BLAKE2B_IV32[i];
+  a[8]  ^= SOLVER_INPUT_SIZE; // v[24] ^= totalBytesHashed (always SOLVER_INPUT_SIZE = 128)
+  a[12]  = ~a[12];            // v[28] finalization flag
+  a[13]  = ~a[13];            // v[29] finalization flag
+  return a;
+})();
 
 /** Holds the mutable state for one Blake2b-256 computation. */
 class Blake2bState {
@@ -317,33 +342,82 @@ function wrapAssemblyScriptExports(wasmExports) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Creates a pure-JS Blake2b solver function.
+ * Creates an optimised pure-JS Blake2b solver function.
  *
- * The returned solver repeatedly hashes the 128-byte `inputBuffer` while
- * incrementing the uint32 counter stored at bytes 124–127 (little-endian).
- * It returns on the first hash whose first uint32 word is below `threshold`.
+ * Two hot-path optimisations compared to a naïve implementation:
+ *
+ *  1. Static message words pre-loaded — the 128-byte solver input has 31 of its
+ *     32 uint32 message words (m[0]..m[30], bytes 0–123) that are constant for
+ *     the entire inner solve loop.  Only m[31] (bytes 124–127, the inner nonce
+ *     counter) changes per iteration.  Loading the constant 31 words once
+ *     before the loop avoids 31 × readUint32LE calls and a 128-byte buffer copy
+ *     on every hash.
+ *
+ *  2. Pre-computed working vector lower half (STATIC_V_LO) — for all single-block
+ *     finalized hashes the lower half of the working vector is identical.  Using
+ *     the pre-computed constant saves 3 ops (one XOR + two NOT) per hash.
  *
  * @returns {Function} (inputBuffer, threshold, maxIterations?) => [inputBuffer, hashBytes]
  */
 function createJsSolver() {
-  const state = new Blake2bState(32);
-  state.totalBytesHashed = 128;
+  const h = new Uint32Array(16); // hash state (re-initialised each hash)
+  const v = new Uint32Array(32); // working vector
+  const m = new Uint32Array(32); // message schedule
 
   return function jsSolve(inputBuffer, threshold, maxIterations = 0xFFFFFFFF) {
     if (inputBuffer.length !== 128) throw new Error('Solver input must be exactly 128 bytes');
 
+    // Pre-load the 31 static message words (bytes 0–123).
+    // Only m[31] (bytes 124–127, the inner nonce counter) changes per iteration.
+    for (let i = 0; i < 31; i++) m[i] = readUint32LE(inputBuffer, 4 * i);
+
     const view         = new DataView(inputBuffer.buffer, inputBuffer.byteOffset, 128);
     const startCounter = view.getUint32(124, /*littleEndian=*/true);
-    // endCounter may exceed 32-bit range; that is intentional — setUint32 will
-    // naturally truncate the written value to 32 bits, so the nonce wraps around.
+    // endCounter may exceed 32-bit range; that is intentional — the counter value
+    // stored in m[31] wraps naturally inside the 32-bit Uint32Array slot.
     const endCounter   = startCounter + maxIterations;
 
     for (let counter = startCounter; counter < endCounter; counter++) {
-      view.setUint32(124, counter, /*littleEndian=*/true);
-      blake2bInitWithInput(state, inputBuffer);
-      blake2bCompress(state, /*isFinalBlock=*/true);
-      if (state.hashWords[0] < threshold) {
-        return [inputBuffer, new Uint8Array(state.hashWords.buffer)];
+      // Only the counter word changes — no need to copy the full 128-byte buffer.
+      m[31] = counter;
+
+      // Re-initialise hash state from IVs + Blake2b-256 parameter block word.
+      for (let i = 0; i < 16; i++) h[i] = BLAKE2B_IV32[i];
+      h[0] ^= 0x01010000 ^ BLAKE2B_256_DIGEST_SIZE; // parameter block: digest length
+
+      // Initialise working vector:
+      //   v[0..15]  = current hash state h[0..15]
+      //   v[16..31] = STATIC_V_LO (pre-computed IV with byte-counter XOR and
+      //               finalization flags already baked in)
+      for (let i = 0; i < 16; i++) {
+        v[i]      = h[i];
+        v[i + 16] = STATIC_V_LO[i];
+      }
+
+      // 12 compression rounds (column + diagonal mixing)
+      for (let round = 0; round < 12; round++) {
+        const base = 16 * round;
+        const s = BLAKE2B_SIGMA;
+        // Column step
+        blake2bMix(v, m,  0,  8, 16, 24, s[base +  0], s[base +  1]);
+        blake2bMix(v, m,  2, 10, 18, 26, s[base +  2], s[base +  3]);
+        blake2bMix(v, m,  4, 12, 20, 28, s[base +  4], s[base +  5]);
+        blake2bMix(v, m,  6, 14, 22, 30, s[base +  6], s[base +  7]);
+        // Diagonal step
+        blake2bMix(v, m,  0, 10, 20, 30, s[base +  8], s[base +  9]);
+        blake2bMix(v, m,  2, 12, 22, 24, s[base + 10], s[base + 11]);
+        blake2bMix(v, m,  4, 14, 16, 26, s[base + 12], s[base + 13]);
+        blake2bMix(v, m,  6,  8, 18, 28, s[base + 14], s[base + 15]);
+      }
+
+      // Finalise: XOR working vector back into hash state
+      for (let i = 0; i < 16; i++) h[i] ^= v[i] ^ v[i + 16];
+
+      if (h[0] < threshold) {
+        // Write the winning counter back into the input buffer so the caller
+        // can read bytes 124–127 as the nonce.
+        view.setUint32(124, counter, /*littleEndian=*/true);
+        return [inputBuffer, new Uint8Array(h.buffer)];
       }
     }
 
@@ -394,9 +468,6 @@ const PUZZLE_EXPIRY_OFFSET     = 13;
 const PUZZLE_NUM_PUZZLES_OFFSET = 14;
 const PUZZLE_DIFFICULTY_OFFSET  = 15;
 
-/** Size of the 128-byte solver input block. */
-const SOLVER_INPUT_SIZE = 128;
-
 /** Byte index within solverInput where the puzzle index lives. */
 const PUZZLE_INDEX_BYTE = 120;
 
@@ -443,7 +514,8 @@ function difficultyToThreshold(difficultyByte) {
  *
  * @param {string} puzzleString
  * @returns {{ signature: string, puzzleBase64: string, baseSolverInput: Uint8Array,
- *             threshold: number, numPuzzles: number, expiryMs: number }}
+ *             threshold: number, numPuzzles: number, expiryMs: number,
+ *             difficultyByte: number }}
  */
 function parsePuzzle(puzzleString) {
   const dotIndex = puzzleString.indexOf('.');
@@ -454,17 +526,17 @@ function parsePuzzle(puzzleString) {
 
   const puzzleBuffer = Buffer.from(puzzleBase64, 'base64');
 
-  const numPuzzles    = puzzleBuffer[PUZZLE_NUM_PUZZLES_OFFSET];
+  const numPuzzles     = puzzleBuffer[PUZZLE_NUM_PUZZLES_OFFSET];
   const difficultyByte = puzzleBuffer[PUZZLE_DIFFICULTY_OFFSET];
-  const expiryMs      = puzzleBuffer[PUZZLE_EXPIRY_OFFSET] * 300_000;
-  const threshold     = difficultyToThreshold(difficultyByte);
+  const expiryMs       = puzzleBuffer[PUZZLE_EXPIRY_OFFSET] * 300_000;
+  const threshold      = difficultyToThreshold(difficultyByte);
 
   // Build the base 128-byte solver input: puzzle buffer at bytes 0–31, rest zeros.
   // Each sub-puzzle gets its own copy with byte 120 set to the puzzle index.
   const baseSolverInput = new Uint8Array(SOLVER_INPUT_SIZE);
   baseSolverInput.set(puzzleBuffer, 0);
 
-  return { signature, puzzleBase64, baseSolverInput, threshold, numPuzzles, expiryMs };
+  return { signature, puzzleBase64, baseSolverInput, threshold, numPuzzles, expiryMs, difficultyByte };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,27 +590,33 @@ function buildSolutionToken(signature, puzzleBase64, solutionBuffer, diagnostics
 
 if (!isMainThread) {
   /**
-   * Initialises the solver: tries the bundled WASM binary first (fast path),
-   * falls back to the pure-JS implementation if WASM is unavailable.
+   * Initialises the solver for this worker thread.
    *
-   * @returns {Promise<{ solver: Function, solverID: number }>}
+   * The native JavaScript solver is used by default — it is consistently faster
+   * in most Node.js environments for this workload because the WASM JIT warm-up
+   * overhead outweighs the throughput advantage at typical puzzle difficulties.
+   *
+   * To opt into the WASM solver instead, set the environment variable:
+   *   FRC_USE_WASM=1
+   *
+   * @returns {Promise<{ solver: Function, solverID: number, solverEngine: string }>}
    */
   async function initSolver() {
-    try {
-      // __dirname is valid here: workers are spawned with new Worker(__filename),
-      // so __dirname always points to the same directory as the main script.
-      const wasmPath  = path.join(__dirname, 'wasm', 'solver.wasm');
-      const wasmBytes = fs.readFileSync(wasmPath);
-      const solver    = await createWasmSolver(wasmBytes);
-      parentPort.postMessage({ type: 'ready', solverEngine: 'wasm' });
-      return { solver, solverID: SOLVER_ID_WASM };
-    } catch (wasmErr) {
-      // WASM unavailable (missing file, unsupported runtime, etc.) — use pure JS.
-      process.stderr.write(`[cap] WASM solver unavailable (${wasmErr.message}), using JS fallback\n`);
-      const solver = createJsSolver();
-      parentPort.postMessage({ type: 'ready', solverEngine: 'js' });
-      return { solver, solverID: SOLVER_ID_JS };
+    if (process.env.FRC_USE_WASM === '1') {
+      try {
+        const wasmPath  = path.join(__dirname, 'wasm', 'solver.wasm');
+        const wasmBytes = fs.readFileSync(wasmPath);
+        const solver    = await createWasmSolver(wasmBytes);
+        parentPort.postMessage({ type: 'ready', solverEngine: 'wasm' });
+        return { solver, solverID: SOLVER_ID_WASM, solverEngine: 'wasm' };
+      } catch (wasmErr) {
+        process.stderr.write(`[cap] FRC_USE_WASM=1 but WASM failed (${wasmErr.message}), using JS\n`);
+      }
     }
+
+    const solver = createJsSolver();
+    parentPort.postMessage({ type: 'ready', solverEngine: 'js' });
+    return { solver, solverID: SOLVER_ID_JS, solverEngine: 'js' };
   }
 
   initSolver().then(({ solver, solverID }) => {
@@ -547,6 +625,7 @@ if (!isMainThread) {
 
       try {
         const { solverInput, threshold, puzzleIndex, numPuzzles } = msg;
+        const solveStart   = Date.now();
 
         let solvedInput    = null;
         let totalHashCount = 0;
@@ -562,7 +641,7 @@ if (!isMainThread) {
             break;
           }
 
-          // Accumulate work: this pass exhausted ~2^32 counter values (0xFFFFFFFF = 2^32 - 1)
+          // Accumulate work: this pass exhausted 2^32 - 1 counter values
           totalHashCount += 0xFFFFFFFF;
         }
 
@@ -575,7 +654,6 @@ if (!isMainThread) {
         }
 
         // Add the final inner-counter value to get total hashes computed.
-        // Matches: g += new DataView(I.slice(-4).buffer).getUint32(0, true)
         const finalCounterView = new DataView(
           solvedInput.buffer, solvedInput.byteOffset + INNER_NONCE_OFFSET, 4
         );
@@ -586,16 +664,16 @@ if (!isMainThread) {
         //   bytes 121–122: zeros
         //   byte 123: outer nonce that succeeded
         //   bytes 124–127: inner counter value that produced hash < threshold
-        // This matches `solution: I.slice(-8)` in the original WebWorker.
         const solutionSegment = Buffer.from(solvedInput.slice(PUZZLE_INDEX_BYTE, SOLVER_INPUT_SIZE));
 
         parentPort.postMessage({
           type: 'done',
-          solutionSegment,      // 8-byte Buffer (bytes 120–127 of the solved input)
-          solverID,             // SOLVER_ID_JS or SOLVER_ID_WASM
-          totalHashCount,       // total Blake2b hashes computed
-          puzzleIndex,          // which sub-puzzle this solves (0-based)
-          numPuzzles            // total number of sub-puzzles in this challenge
+          solutionSegment,               // 8-byte Buffer (bytes 120–127 of solved input)
+          solverID,                      // SOLVER_ID_JS or SOLVER_ID_WASM
+          totalHashCount,                // total Blake2b hashes computed
+          solveMs: Date.now() - solveStart, // wall-clock time spent solving (ms)
+          puzzleIndex,                   // which sub-puzzle this solves (0-based)
+          numPuzzles                     // total number of sub-puzzles in this challenge
         });
       } catch (err) {
         parentPort.postMessage({ type: 'error', message: err.message });
@@ -691,37 +769,65 @@ if (isMainThread) {
    * Solves a raw puzzle string and returns the `frc-captcha-solution` token.
    *
    * All sub-puzzles are solved concurrently (one Worker Thread each).
+   * Progress is logged to stderr so stdout carries only the final token.
    *
    * @param {string} puzzleString - the raw puzzle string from the API
    * @returns {Promise<string>} the frc-captcha-solution token ready for form submission
    */
   async function solvePuzzleString(puzzleString) {
-    const { signature, puzzleBase64, baseSolverInput, threshold, numPuzzles } =
+    const { signature, puzzleBase64, baseSolverInput, threshold, numPuzzles, difficultyByte } =
       parsePuzzle(puzzleString);
+
+    const engine = process.env.FRC_USE_WASM === '1' ? 'wasm' : 'js';
+    process.stderr.write(
+      `[cap] Solving ${numPuzzles} sub-puzzle(s) | difficulty ${difficultyByte}` +
+      ` | threshold 0x${threshold.toString(16).toUpperCase()} | engine: ${engine}\n`
+    );
 
     const startTime = Date.now();
 
-    // Solve all sub-puzzles concurrently, one worker per sub-puzzle
+    // Solve all sub-puzzles concurrently, one worker per sub-puzzle.
+    // Each .then() logs per-puzzle completion as soon as a worker finishes.
     const workerResults = await Promise.all(
       Array.from({ length: numPuzzles }, (_, i) =>
-        runWorkerSolver(baseSolverInput, threshold, i, numPuzzles)
+        runWorkerSolver(baseSolverInput, threshold, i, numPuzzles).then((result) => {
+          const ms   = result.solveMs;
+          const rate = ms > 0 ? Math.round(result.totalHashCount / (ms / 1000)) : Infinity;
+          const rateStr = rate === Infinity ? '∞' : rate >= 1e6
+            ? `${(rate / 1e6).toFixed(2)}M`
+            : `${(rate / 1e3).toFixed(0)}K`;
+          process.stderr.write(
+            `[cap] Puzzle ${result.puzzleIndex + 1}/${numPuzzles} solved` +
+            ` | ${ms}ms | ${result.totalHashCount.toLocaleString()} hashes | ${rateStr} h/s\n`
+          );
+          return result;
+        })
       )
     );
 
-    const totalSeconds = (Date.now() - startTime) / 1000;
+    const totalMs = Date.now() - startTime;
 
-    // Assemble the solution buffer: 8 bytes per sub-puzzle in index order
+    // Assemble the solution buffer: 8 bytes per sub-puzzle in index order.
     const solutionBuffer = new Uint8Array(numPuzzles * 8);
-    let   totalHashCount = 0;
-    let   solverID       = SOLVER_ID_WASM; // downgrade to JS if any worker used JS fallback
+    let totalHashCount   = 0;
+    let solverID         = SOLVER_ID_JS; // upgraded to WASM if any worker used it
 
     for (const result of workerResults) {
       solutionBuffer.set(result.solutionSegment, result.puzzleIndex * 8);
       totalHashCount += result.totalHashCount;
-      if (result.solverID === SOLVER_ID_JS) solverID = SOLVER_ID_JS;
+      if (result.solverID === SOLVER_ID_WASM) solverID = SOLVER_ID_WASM;
     }
 
-    const diagnostics = buildDiagnosticsBuffer(solverID, totalSeconds);
+    const combinedRate = totalMs > 0 ? Math.round(totalHashCount / (totalMs / 1000)) : Infinity;
+    const combinedRateStr = combinedRate === Infinity ? '∞' : combinedRate >= 1e6
+      ? `${(combinedRate / 1e6).toFixed(2)}M`
+      : `${(combinedRate / 1e3).toFixed(0)}K`;
+    process.stderr.write(
+      `[cap] Done — ${numPuzzles}/${numPuzzles} puzzles in ${totalMs}ms` +
+      ` | total ${totalHashCount.toLocaleString()} hashes | combined rate: ${combinedRateStr} h/s\n`
+    );
+
+    const diagnostics = buildDiagnosticsBuffer(solverID, totalMs / 1000);
     const token       = buildSolutionToken(signature, puzzleBase64, solutionBuffer, diagnostics);
 
     return token;
@@ -734,8 +840,9 @@ if (isMainThread) {
    * @returns {Promise<string>} the frc-captcha-solution token
    */
   async function fetchAndSolvePuzzle(siteKey) {
+    process.stderr.write(`[cap] Fetching puzzle for sitekey: ${siteKey}\n`);
     const puzzleString = await fetchPuzzle(siteKey);
-    console.log(`[cap] Fetched puzzle: ${puzzleString}`);
+    process.stderr.write(`[cap] Puzzle received: ${puzzleString}\n`);
     return solvePuzzleString(puzzleString);
   }
 
@@ -754,16 +861,17 @@ if (isMainThread) {
     const EXAMPLE_SITE_KEY = 'FCMSPLFFSPQ6TH80';
     const siteKey = process.argv[2] || EXAMPLE_SITE_KEY;
 
-    console.log(`[cap] Solving FriendlyCaptcha puzzle for sitekey: ${siteKey}`);
+    process.stderr.write(`[cap] FriendlyCaptcha solver — node cap.js [sitekey]\n`);
+    process.stderr.write(`[cap] Solver engine: ${process.env.FRC_USE_WASM === '1' ? 'wasm (FRC_USE_WASM=1)' : 'js (default)'}\n`);
 
     fetchAndSolvePuzzle(siteKey)
       .then((token) => {
-        console.log('[cap] frc-captcha-solution token:');
-        console.log(token);
+        process.stderr.write('[cap] frc-captcha-solution token:\n');
+        console.log(token); // token goes to stdout for easy piping
         process.exit(0);
       })
       .catch((err) => {
-        console.error('[cap] Error:', err.message);
+        process.stderr.write(`[cap] Error: ${err.message}\n`);
         process.exit(1);
       });
   }

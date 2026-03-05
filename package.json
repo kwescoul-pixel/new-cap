@@ -1,7 +1,7 @@
 {
   "name": "new-cap",
   "version": "1.0.0",
-  "description": "FriendlyCaptcha puzzle solver for Node.js using Blake2b (WASM + JS fallback) with native Worker Threads",
+  "description": "FriendlyCaptcha puzzle solver for Node.js — optimised pure-JS Blake2b (WASM opt-in via FRC_USE_WASM=1) with native Worker Threads",
   "main": "cap.js",
   "scripts": {
     "start": "node cap.js"

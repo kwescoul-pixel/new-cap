@@ -1,0 +1,14 @@
+{
+  "name": "new-cap",
+  "version": "1.0.0",
+  "description": "FriendlyCaptcha puzzle solver for Node.js using Blake2b (WASM + JS fallback) with native Worker Threads",
+  "main": "cap.js",
+  "scripts": {
+    "start": "node cap.js"
+  },
+  "engines": {
+    "node": ">=12.0.0"
+  },
+  "keywords": ["friendlycaptcha", "captcha", "blake2b", "wasm", "worker-threads"],
+  "license": "MIT"
+}

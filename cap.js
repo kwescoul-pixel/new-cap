@@ -606,7 +606,7 @@ if (isMainThread) {
   function fetchPuzzle(siteKey) {
     return new Promise((resolve, reject) => {
       const url = `https://api.friendlycaptcha.com/api/v1/puzzle?sitekey=${encodeURIComponent(siteKey)}`;
-      https.get(url, (res) => {
+      const req = https.get(url, (res) => {
         let rawBody = '';
         res.on('data', (chunk) => { rawBody += chunk; });
         res.on('end', () => {
@@ -694,7 +694,7 @@ if (isMainThread) {
     // Assemble the solution buffer: 8 bytes per sub-puzzle in index order
     const solutionBuffer = new Uint8Array(numPuzzles * 8);
     let   totalHashCount = 0;
-    let   solverID       = SOLVER_ID_WASM; // downgrade to JS if any worker used JS
+    let   solverID       = SOLVER_ID_JS;
 
     for (const result of workerResults) {
       solutionBuffer.set(result.solutionSegment, result.puzzleIndex * 8);
